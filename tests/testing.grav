@@ -1,0 +1,112 @@
+// apogee-testing's tests: a small app on the router, exercised through
+// TestClient: status, body, JSON and validation assertions, forms, JSON
+// bodies, headers and tokens, cookies kept between requests, redirects,
+// acting as a user, and failed assertions.
+import "std"
+import "std/net"
+import "apogee-container"
+import "apogee-http"
+import "apogee-routing"
+import "../src/testing.grav"
+use apogee.*
+
+class User { public name: string  constructor(name: string) { self.name = name } }
+
+fn app() -> HttpKernel {
+    let r = new Router(new Container())
+    r.get("/", fn(req: Request) -> Response { return Response.html("<h1>Welcome to the shop</h1><p>first</p><p>second</p>") })
+    r.get("/api/posts", fn(req: Request) -> Response {
+        return Response.json({"data": [{"title": "A", "votes": 2}, {"title": "B", "votes": 5}], "total": 2})
+    })
+    r.post("/api/posts", fn(req: Request) -> Response {
+        let title = str(req.input("title", ""))
+        if (title == "") {
+            return Response.json({"message": "The title field is required.", "errors": {"title": ["The title field is required."]}}, 422)
+        }
+        return Response.json({"data": {"title": title}}, 201)
+    })
+    r.post("/form", fn(req: Request) -> Response { return Response.text("got " + str(req.input("name", "")) + " " + str(req.input("city", ""))) })
+    r.get("/me", fn(req: Request) -> Response {
+        if (req.user == null) { return Response.json({"message": "Unauthenticated."}, 401) }
+        return Response.text("hello " + (req.user as User).name + " via " + str(req.get("auth.guard", "")))
+    })
+    r.get("/token", fn(req: Request) -> Response { return Response.text("token=" + req.bearerToken() + " x=" + req.header("X-Thing")) })
+    r.get("/set", fn(req: Request) -> Response { return Response.text("set").withCookie(new Cookie("flavor", "choc")) })
+    r.get("/cookie", fn(req: Request) -> Response { return Response.text("flavor=" + req.cookie("flavor")) })
+    r.get("/forget", fn(req: Request) -> Response { return Response.text("gone").withCookie(new Cookie("flavor", "").maxAge(0)) })
+    r.get("/old", fn(req: Request) -> Response { return Response.redirect("/new") })
+    r.get("/new", fn(req: Request) -> Response { return Response.text("the new page").header("X-Page", "new") })
+    r.delete("/api/posts/{id}", fn(req: Request) -> Response { return Response.noContent() })
+    return new HttpKernel(r)
+}
+
+test "status and body" {
+    let c = new TestClient(app())
+    c.get("/").assertOk().assertSuccessful().assertSee("Welcome").assertDontSee("Goodbye").assertSeeInOrder(["first", "second"])
+    c.get("/missing").assertNotFound()
+    c.delete("/api/posts/3").assertNoContent()
+}
+
+test "JSON assertions" {
+    let c = new TestClient(app())
+    let res = c.getJson("/api/posts").assertOk()
+    res.assertJsonPath("data.1.title", "B").assertJsonPath("total", 2).assertJsonCount(2, "data")
+    res.assertJson({"total": 2}).assertJsonMissingPath("data.2").assertHeader("Content-Type")
+    assertEq(res.jsonAt("data.0.votes").asInt(), 2)
+    res.assertExactJson({"data": [{"title": "A", "votes": 2}, {"title": "B", "votes": 5}], "total": 2})
+}
+
+test "JSON bodies and validation errors" {
+    let c = new TestClient(app())
+    c.postJson("/api/posts", {"title": "Hello"}).assertCreated().assertJsonPath("data.title", "Hello").assertValid()
+    c.postJson("/api/posts", new HashMap<string, any>()).assertInvalid(["title"])
+}
+
+test "forms" {
+    let form = new HashMap<string, string>()
+    form.put("name", "Ada Lovelace")
+    form.put("city", "London & Paris")
+    new TestClient(app()).post("/form", form).assertOk().assertSee("got Ada Lovelace London & Paris")
+}
+
+test "headers and tokens" {
+    new TestClient(app()).withToken("abc123").withHeader("X-Thing", "42").get("/token").assertSee("token=abc123 x=42")
+}
+
+test "cookies are kept between requests" {
+    let c = new TestClient(app())
+    c.get("/set").assertCookie("flavor", "choc")
+    c.get("/cookie").assertSee("flavor=choc")
+    c.get("/forget").assertCookieExpired("flavor")
+    c.get("/cookie").assertSee("flavor=")
+    assert(!c.cookies().containsKey("flavor"))
+    c.withCookie("flavor", "mint").get("/cookie").assertSee("flavor=mint")
+}
+
+test "redirects, followed or not" {
+    let c = new TestClient(app())
+    c.get("/old").assertRedirect("/new")
+    c.followingRedirects().get("/old").assertOk().assertSee("the new page").assertHeader("X-Page", "new")
+}
+
+test "acting as a user" {
+    let c = new TestClient(app())
+    c.getJson("/me").assertUnauthorized()
+    c.actingAs(new User("Grace"), "api").get("/me").assertOk().assertSee("hello Grace via api")
+    c.asGuest().getJson("/me").assertUnauthorized()
+}
+
+test "a failed assertion says what went wrong" {
+    let c = new TestClient(app())
+    let msg = ""
+    try { c.get("/missing").assertOk() } catch (e: AssertionFailed) { msg = e.message() }
+    assert(Str.contains(msg, "expected status 200 but got 404"))
+    msg = ""
+    try { c.getJson("/api/posts").assertJsonPath("data.0.title", "Z") } catch (e: AssertionFailed) { msg = e.message() }
+    assert(Str.contains(msg, "expected JSON 'data.0.title' to be \"Z\" but it is \"A\""))
+}
+
+test "any handler function" {
+    let c = TestClient.forHandler(fn(req: Request) -> Response { return Response.text("direct " + req.path()) })
+    c.get("/x/y").assertOk().assertSee("direct /x/y")
+}
