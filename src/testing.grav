@@ -1,0 +1,395 @@
+// testing.grav — testing Apogee apps without a server: requests go straight
+// into the app's HTTP kernel, and the responses come back with assertions.
+//
+//   let client = new TestClient(app.http())             // or any HttpKernel
+//   client.get("/").assertOk().assertSee("Welcome")
+//   client.postJson("/api/posts", {"title": "Hi"}).assertCreated().assertJsonPath("data.title", "Hi")
+//   client.actingAs(user).get("/dashboard").assertOk()
+//   client.postJson("/api/posts", {}).assertInvalid(["title"])
+//
+// Cookies the app sets are sent back on later requests (a session survives
+// from one request to the next), and redirects can be followed. A failed
+// assertion throws AssertionFailed, whose message says what was expected and
+// what came back, so the test fails with it.
+import "std"
+import "std/net"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-container"
+
+namespace apogee {
+
+    // An assertion about a response did not hold.
+    class AssertionFailed extends Exception {
+        constructor(message: string) { super(message); }
+    }
+
+    // Makes requests to an app in this process.
+    class TestClient {
+        private handler: fn(Request) -> Response
+        private headers: Headers
+        private jar: HashMap<string, string>
+        private follow: bool = false
+        private user: any = null
+        private guard: string = "web"
+        public host: string = "localhost"
+        public remote: string = "127.0.0.1:50000"
+
+        constructor(kernel: HttpKernel) {
+            self.handler = fn(req: Request) -> Response { return kernel.handleRequest(req); };
+            self.headers = new Headers();
+            self.jar = new HashMap<string, string>();
+        }
+        // A client for any function from a request to a response.
+        static fn forHandler(handler: fn(Request) -> Response) -> TestClient {
+            let c = new TestClient(new HttpKernel(new Router(new Container())));
+            c.handler = handler;
+            return c;
+        }
+
+        // ── what every request carries ─────────────────────────────────────────
+        fn withHeader(name: string, value: string) -> TestClient { self.headers.set(name, value); return self; }
+        fn withHeaders(values: HashMap<string, string>) -> TestClient {
+            for ((k, v) in values) { self.headers.set(k, v); }
+            return self;
+        }
+        // "Authorization: Bearer <token>".
+        fn withToken(token: string, kind: string = "Bearer") -> TestClient { return self.withHeader("Authorization", kind + " " + token); }
+        fn withCookie(name: string, value: string) -> TestClient { self.jar.put(name, value); return self; }
+        fn withoutCookies() -> TestClient { self.jar.clear(); return self; }
+        // The cookies the client holds (sent with every request).
+        fn cookies() -> HashMap<string, string> { return self.jar; }
+        // Follow redirects (up to 10) and return the last response.
+        fn followingRedirects(on: bool = true) -> TestClient { self.follow = on; return self; }
+        // Requests are made as `user`, signed in through `guard` (the guards of
+        // apogee-auth take a user already on the request as theirs).
+        fn actingAs(user: any, guard: string = "web") -> TestClient { self.user = user; self.guard = guard; return self; }
+        fn asGuest() -> TestClient { self.user = null; return self; }
+
+        // ── requests ───────────────────────────────────────────────────────────
+        fn get(uri: string) -> TestResponse { return self.call("GET", uri, null, ""); }
+        fn getJson(uri: string) -> TestResponse { return self.json("GET", uri, null); }
+        fn delete(uri: string) -> TestResponse { return self.call("DELETE", uri, null, ""); }
+        fn deleteJson(uri: string, data: any = null) -> TestResponse { return self.json("DELETE", uri, data); }
+        fn post(uri: string, form: HashMap<string, string> = null) -> TestResponse { return self.form("POST", uri, form); }
+        fn put(uri: string, form: HashMap<string, string> = null) -> TestResponse { return self.form("PUT", uri, form); }
+        fn patch(uri: string, form: HashMap<string, string> = null) -> TestResponse { return self.form("PATCH", uri, form); }
+        fn postJson(uri: string, data: any) -> TestResponse { return self.json("POST", uri, data); }
+        fn putJson(uri: string, data: any) -> TestResponse { return self.json("PUT", uri, data); }
+        fn patchJson(uri: string, data: any) -> TestResponse { return self.json("PATCH", uri, data); }
+        // A JSON request (`data` JSON-plain, or null for no body) that accepts JSON.
+        fn json(method: string, uri: string, data: any) -> TestResponse {
+            let extra = new Headers();
+            extra.set("Accept", "application/json");
+            let body = data == null ? null : Bytes.fromString(JsonText.encode(data));
+            return self.send(method, uri, body, data == null ? "" : "application/json", extra);
+        }
+        private fn form(method: string, uri: string, form: HashMap<string, string>) -> TestResponse {
+            if (form == null) { return self.call(method, uri, null, ""); }
+            let parts = new Array<string>();
+            for ((k, v) in form) { parts.push(Url.encode(k) + "=" + Url.encode(v)); }
+            return self.call(method, uri, Bytes.fromString(Str.join(parts, "&")), "application/x-www-form-urlencoded");
+        }
+        // Any request.
+        fn call(method: string, uri: string, body: Bytes, contentType: string) -> TestResponse {
+            return self.send(method, uri, body, contentType, null);
+        }
+        private fn send(method: string, uri: string, body: Bytes, contentType: string, extra: Headers) -> TestResponse {
+            let res = self.once(method, uri, body, contentType, extra);
+            let hops = 0;
+            while (self.follow && hops < 10 && res.status >= 300 && res.status < 400 && res.header("Location") != "") {
+                hops += 1;
+                let to = TestClient.localPart(res.header("Location"));
+                let keep = res.status == 307 || res.status == 308;
+                res = self.once(keep ? method : "GET", to, keep ? body : null, keep ? contentType : "", extra);
+            }
+            return res;
+        }
+        private fn once(method: string, uri: string, body: Bytes, contentType: string, extra: Headers) -> TestResponse {
+            let http = new HttpRequest(method, Str.startsWith(uri, "/") ? uri : "/" + uri, "HTTP/1.1");
+            http.remote = self.remote;
+            http.headers.set("Host", self.host);
+            http.headers.addAll(self.headers);
+            if (extra != null) { for (i in 0..extra.size()) { http.headers.set(extra.nameAt(i), extra.valueAt(i)); } }
+            if (self.jar.size() > 0) {
+                let parts = new Array<string>();
+                for ((k, v) in self.jar) { parts.push(k + "=" + v); }
+                http.headers.set("Cookie", Str.join(parts, "; "));
+            }
+            if (body != null) {
+                http.bodyBytes = body;
+                http.headers.set("Content-Length", str(body.size()));
+                if (contentType != "") { http.headers.set("Content-Type", contentType); }
+            }
+            let req = new Request(http);
+            if (self.user != null) {
+                req.user = self.user;
+                req.set("auth.guard", self.guard);
+            }
+            let handle = self.handler;
+            let res = handle(req);
+            for (c in res.http.cookies()) {
+                if (c.maxAgeSeconds == 0) { self.jar.remove(c.name); } else { self.jar.put(c.name, c.value); }
+            }
+            return new TestResponse(res.http);
+        }
+        // "/path?query" of an absolute URL (the app's own host or not).
+        private static fn localPart(location: string) -> string {
+            let at = Str.indexOf(location, "://");
+            if (at < 0) { return location; }
+            let rest = location[at + 3..];
+            let slash = Str.indexOf(rest, "/");
+            return slash < 0 ? "/" : rest[slash..];
+        }
+    }
+
+    // A response, with assertions that return it (so they chain).
+    class TestResponse {
+        public http: HttpResponse
+        private parsed: JsonValue = null
+        constructor(http: HttpResponse) { self.http = http; }
+
+        get status() -> int { return self.http.status; }
+        fn body() -> string { return self.http.body(); }
+        fn header(name: string) -> string { return self.http.headers.get(name); }
+        // The body as JSON (AssertionFailed when it is not).
+        fn json() -> JsonValue {
+            if (self.parsed == null) {
+                try { self.parsed = Json.parse(self.body()); }
+                catch (e: ValueError) { self.fail("the response is not JSON: " + TestResponse.excerpt(self.body())); }
+            }
+            return self.parsed;
+        }
+        // The JSON value at a dotted path ("data.0.name"), or null.
+        fn jsonAt(path: string) -> JsonValue { return JsonText.at(self.json(), path); }
+
+        // ── status ─────────────────────────────────────────────────────────────
+        fn assertStatus(code: int) -> TestResponse {
+            if (self.status != code) {
+                self.fail("expected status ${code} but got ${self.status}: " + TestResponse.excerpt(self.body()));
+            }
+            return self;
+        }
+        fn assertOk() -> TestResponse { return self.assertStatus(200); }
+        fn assertCreated() -> TestResponse { return self.assertStatus(201); }
+        fn assertAccepted() -> TestResponse { return self.assertStatus(202); }
+        fn assertNoContent() -> TestResponse { return self.assertStatus(204); }
+        fn assertBadRequest() -> TestResponse { return self.assertStatus(400); }
+        fn assertUnauthorized() -> TestResponse { return self.assertStatus(401); }
+        fn assertForbidden() -> TestResponse { return self.assertStatus(403); }
+        fn assertNotFound() -> TestResponse { return self.assertStatus(404); }
+        fn assertMethodNotAllowed() -> TestResponse { return self.assertStatus(405); }
+        fn assertConflict() -> TestResponse { return self.assertStatus(409); }
+        fn assertUnprocessable() -> TestResponse { return self.assertStatus(422); }
+        fn assertTooManyRequests() -> TestResponse { return self.assertStatus(429); }
+        fn assertSuccessful() -> TestResponse {
+            if (self.status < 200 || self.status >= 300) { self.fail("expected a 2xx status but got ${self.status}: " + TestResponse.excerpt(self.body())); }
+            return self;
+        }
+        fn assertServerError() -> TestResponse {
+            if (self.status < 500) { self.fail("expected a 5xx status but got ${self.status}"); }
+            return self;
+        }
+        // A redirect (3xx), to `to` when given (a full URL matches on its path too).
+        fn assertRedirect(to: string = "") -> TestResponse {
+            if (self.status < 300 || self.status >= 400) { self.fail("expected a redirect but got ${self.status}"); }
+            let loc = self.header("Location");
+            if (to != "" && loc != to && !Str.endsWith(loc, "://localhost" + to) && !(Str.contains(loc, "://") && Str.endsWith(loc, to) && Str.startsWith(to, "/"))) {
+                self.fail("expected a redirect to '${to}' but it went to '${loc}'");
+            }
+            return self;
+        }
+
+        // ── body ───────────────────────────────────────────────────────────────
+        fn assertSee(text: string) -> TestResponse {
+            if (!Str.contains(self.body(), text)) { self.fail("expected the response to contain '${text}': " + TestResponse.excerpt(self.body())); }
+            return self;
+        }
+        fn assertDontSee(text: string) -> TestResponse {
+            if (Str.contains(self.body(), text)) { self.fail("expected the response not to contain '${text}'"); }
+            return self;
+        }
+        // Each of `texts`, in this order.
+        fn assertSeeInOrder(texts: Array<string>) -> TestResponse {
+            let rest = self.body();
+            for (t in texts) {
+                let at = Str.indexOf(rest, t);
+                if (at < 0) { self.fail("expected '${t}' (in order) in the response: " + TestResponse.excerpt(self.body())); }
+                rest = rest[at + t.length..];
+            }
+            return self;
+        }
+
+        // ── headers and cookies ────────────────────────────────────────────────
+        // The header is there (and equals `value` when given).
+        fn assertHeader(name: string, value: string = "") -> TestResponse {
+            if (!self.http.headers.has(name)) { self.fail("expected a '${name}' header"); }
+            if (value != "" && self.header(name) != value) { self.fail("expected '${name}: ${value}' but got '${self.header(name)}'"); }
+            return self;
+        }
+        fn assertHeaderMissing(name: string) -> TestResponse {
+            if (self.http.headers.has(name)) { self.fail("expected no '${name}' header, got '${self.header(name)}'"); }
+            return self;
+        }
+        // The response sets cookie `name` (to `value` when given, as sent).
+        fn assertCookie(name: string, value: string = "") -> TestResponse {
+            for (c in self.http.cookies()) {
+                if (c.name != name) { continue; }
+                if (value != "" && c.value != value && Url.decode(c.value) != value) { self.fail("expected cookie '${name}' to be '${value}' but it is '${c.value}'"); }
+                return self;
+            }
+            self.fail("expected the response to set cookie '${name}'");
+            return self;
+        }
+        // The response removes cookie `name` (Max-Age=0).
+        fn assertCookieExpired(name: string) -> TestResponse {
+            for (c in self.http.cookies()) { if (c.name == name && c.maxAgeSeconds == 0) { return self; } }
+            self.fail("expected the response to remove cookie '${name}'");
+            return self;
+        }
+
+        // ── JSON ───────────────────────────────────────────────────────────────
+        // Every key of `expected` is in the JSON object with that value (deeply;
+        // other keys may be there too).
+        fn assertJson(expected: HashMap<string, any>) -> TestResponse {
+            let j = self.json();
+            for ((k, v) in expected) {
+                let at = JsonText.at(j, k);
+                if (at == null || !JsonText.matches(at, v)) {
+                    self.fail("expected JSON '${k}' to be ${JsonText.encode(v)} but it is " + (at == null ? "missing" : at.toJson()));
+                }
+            }
+            return self;
+        }
+        // The value at a dotted path ("data.0.title") equals `expected`.
+        fn assertJsonPath(path: string, expected: any) -> TestResponse {
+            let at = self.jsonAt(path);
+            if (at == null) { self.fail("expected JSON at '${path}' but there is none: " + TestResponse.excerpt(self.body())); }
+            if (!JsonText.matches(at, expected)) { self.fail("expected JSON '${path}' to be ${JsonText.encode(expected)} but it is ${at.toJson()}"); }
+            return self;
+        }
+        fn assertJsonMissingPath(path: string) -> TestResponse {
+            if (self.jsonAt(path) != null) { self.fail("expected no JSON at '${path}', found ${self.jsonAt(path).toJson()}"); }
+            return self;
+        }
+        // The array at `path` ("" for the top) has `count` items.
+        fn assertJsonCount(count: int, path: string = "") -> TestResponse {
+            let at = path == "" ? self.json() : self.jsonAt(path);
+            if (at == null || !(at.isArray() || at.isObject())) { self.fail("expected an array at '${path}'"); }
+            if (at.size() != count) { self.fail("expected ${count} items at '${path}' but there are ${at.size()}"); }
+            return self;
+        }
+        // The JSON is exactly `expected` (compared as JSON values, not as text).
+        fn assertExactJson(expected: any) -> TestResponse {
+            if (!JsonText.matches(self.json(), expected)) {
+                self.fail("expected the JSON to be ${JsonText.encode(expected)} but it is ${self.json().toJson()}");
+            }
+            return self;
+        }
+
+        // ── validation ─────────────────────────────────────────────────────────
+        // A 422 whose JSON "errors" names each field (all when `fields` is empty
+        // only checks that there are errors).
+        fn assertInvalid(fields: Array<string> = new Array<string>()) -> TestResponse {
+            self.assertUnprocessable();
+            let errors = JsonText.at(self.json(), "errors");
+            if (errors == null || !errors.isObject() || errors.size() == 0) { self.fail("expected validation errors: " + TestResponse.excerpt(self.body())); }
+            for (f in fields) {
+                if (!errors.has(f)) { self.fail("expected a validation error for '${f}'; errors: " + errors.toJson()); }
+            }
+            return self;
+        }
+        // No validation errors for `fields` (for any field when empty).
+        fn assertValid(fields: Array<string> = new Array<string>()) -> TestResponse {
+            if (self.status != 422) { return self; }
+            let errors = JsonText.at(self.json(), "errors");
+            if (errors == null) { return self; }
+            if (fields.size() == 0 && errors.size() > 0) { self.fail("expected no validation errors; errors: " + errors.toJson()); }
+            for (f in fields) {
+                if (errors.has(f)) { self.fail("expected no validation error for '${f}'; errors: " + errors.toJson()); }
+            }
+            return self;
+        }
+
+        // Prints the status, headers and body (while writing a test).
+        fn dump() -> TestResponse {
+            println("HTTP ${self.status}");
+            for (i in 0..self.http.headers.size()) { println(self.http.headers.nameAt(i) + ": " + self.http.headers.valueAt(i)); }
+            println("");
+            println(self.body());
+            return self;
+        }
+
+        private fn fail(message: string) { throw new AssertionFailed(message); }
+        private static fn excerpt(s: string) -> string {
+            let t = Str.trim(s);
+            return t == "" ? "(empty body)" : (t.length > 300 ? t[..300] + "..." : t);
+        }
+    }
+
+    // JSON-plain values (null, bool, numbers, strings, Array<any>, HashMap<string, any>,
+    // JsonValue) to JSON text, paths into JSON, and comparing JSON with them.
+    class JsonText {
+        static fn encode(v: any) -> string { return JsonText.of(v).toJson(); }
+        static fn of(v: any) -> JsonValue {
+            if (v == null) { return Json.nil(); }
+            if (v is JsonValue) { return v as JsonValue; }
+            if (v is bool) { return Json.of(v as bool); }
+            if (v is long) { return Json.of(v as long); }
+            if (v is int) { return Json.of((v as int) as long); }
+            if (v is float) { return Json.of(v as float); }
+            if (v is double) { return Json.of(v as double); }
+            if (v is string) { return Json.of(v as string); }
+            if (v is HashMap<string, any>) {
+                let o = Json.object();
+                for ((k, x) in v as HashMap<string, any>) { o.set(k, JsonText.of(x)); }
+                return o;
+            }
+            if (v is HashMap<string, string>) {
+                let o = Json.object();
+                for ((k, x) in v as HashMap<string, string>) { o.set(k, x); }
+                return o;
+            }
+            if (v is Array<any>) {
+                let a = Json.array();
+                for (x in v as Array<any>) { a.push(JsonText.of(x)); }
+                return a;
+            }
+            return Json.of(str(v));
+        }
+        // The value at "a.0.b" (object keys and array indexes), or null.
+        static fn at(j: JsonValue, path: string) -> JsonValue {
+            if (path == "") { return j; }
+            let cur = j;
+            for (seg in Str.split(path, ".")) {
+                if (cur == null) { return null; }
+                if (cur.isObject()) { cur = cur.has(seg) ? cur.get(seg) : null; }
+                else if (cur.isArray()) {
+                    let i = Integer.parseOr(seg, -1) as int;
+                    cur = i >= 0 && i < cur.size() ? cur.at(i) : null;
+                }
+                else { return null; }
+            }
+            return cur;
+        }
+        // Whether JSON `j` is the value `v` (numbers compare by value: 2 is 2.0).
+        static fn matches(j: JsonValue, v: any) -> bool {
+            let e = JsonText.of(v);
+            return JsonText.same(j, e);
+        }
+        private static fn same(a: JsonValue, b: JsonValue) -> bool {
+            if (a.isNumber() && b.isNumber()) { return a.asFloat() == b.asFloat(); }
+            if (a.kind() != b.kind()) { return false; }
+            if (a.isNull()) { return true; }
+            if (a.isBool()) { return a.asBool() == b.asBool(); }
+            if (a.isString()) { return a.asString() == b.asString(); }
+            if (a.size() != b.size()) { return false; }
+            if (a.isArray()) {
+                for (i in 0..a.size()) { if (!JsonText.same(a.at(i), b.at(i))) { return false; } }
+                return true;
+            }
+            for ((k, x) in b.entries()) { if (!a.has(k) || !JsonText.same(a.get(k), x)) { return false; } }
+            return true;
+        }
+    }
+}
