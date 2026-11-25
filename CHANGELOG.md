@@ -6,6 +6,10 @@ compiler versions it builds with.
 
 ## Unreleased
 
+### Dependencies
+
+- Uses apogee-http 0.3.0, apogee-routing 0.3.0 (from their GitHub tags).
+
 ## 0.1.0 (2026-11-20)
 
 The first release. Needs grav 1.10.0 or newer.
