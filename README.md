@@ -4,7 +4,7 @@ Testing [Apogee](https://github.com/venomous-maker) apps without a server:
 requests go straight into the app's HTTP kernel, in the same process, and the
 responses come back with assertions that chain.
 
-```grav
+```typescript
 import "std"
 import "apogee-testing"
 use apogee.*
